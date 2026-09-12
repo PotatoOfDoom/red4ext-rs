@@ -81,8 +81,14 @@ impl GameTime {
 
 impl std::fmt::Display for GameTime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let [day, hour, min, sec] = unsafe { self.0.ToString().0 };
-        write!(f, "{day}T{hour}:{min}:{sec}")
+        write!(
+            f,
+            "{}T{}:{}:{}",
+            self.day(),
+            self.hour(),
+            self.minute(),
+            self.second()
+        )
     }
 }
 
@@ -279,6 +285,19 @@ impl chrono::Timelike for GameTime {
 #[cfg(test)]
 mod tests {
     use super::GameTime;
+
+    #[test]
+    fn display_formats_time_components() {
+        for (seconds, expected) in [
+            (0, "0T0:0:0"),
+            (86_399, "0T23:59:59"),
+            (86_400, "1T0:0:0"),
+            (93_784, "1T2:3:4"),
+            (u32::MAX, "49710T6:28:15"),
+        ] {
+            assert_eq!(GameTime::from(seconds).to_string(), expected);
+        }
+    }
 
     #[test]
     fn instantiation() {
