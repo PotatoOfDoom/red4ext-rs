@@ -27,6 +27,8 @@ fn main() {
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .default_enum_style(bindgen::EnumVariation::ModuleConsts)
         .derive_default(true)
+        // temp bugfix for bindgen 0.73.0
+        .impl_debug(true)
         .enable_cxx_namespaces()
         .wrap_static_fns(true)
         .vtable_generation(true)
