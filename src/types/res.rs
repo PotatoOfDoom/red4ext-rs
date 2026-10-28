@@ -7,14 +7,25 @@ use thiserror::Error;
 use crate::raw::root::RED4ext::{self as red};
 use crate::{NativeRepr, fnv1a64};
 
+/// Maximum normalized resource-path length in UTF-8 bytes.
 pub const MAX_LENGTH: usize = 216;
 
-/// An asynchronous resource reference.
+/// A resource's archive-path hash, typed by the expected resource `T`.
+///
+/// Corresponds to REDscript `raRef<T>`. Stores no loaded resource and does not
+/// start loading when constructed or copied. Equality compares path hashes.
+///
+/// SDK: [RaRef](https://github.com/WopsS/RED4ext.SDK/blob/2216befc23924b46996a9335043aebb31ba6a757/include/RED4ext/ResourceReference.hpp).
 #[derive(Debug, Default, Clone, Copy)]
 #[repr(transparent)]
 pub struct RaRef<T>(red::RaRef, PhantomData<T>);
 
 impl<T> RaRef<T> {
+    /// Creates a reference from an archive-relative path, such as `base/mod/item.ent`.
+    ///
+    /// Normalizes ASCII case and path separators before hashing. Returns an error
+    /// for an empty, overlong, non-UTF-8, or noncanonical path. Does not check that
+    /// the resource exists or has type `T`.
     pub fn new(path: impl AsRef<Path>) -> Result<Self, ResourcePathError> {
         Ok(Self(
             red::RaRef {
@@ -55,9 +66,17 @@ impl<T> Hash for RaRef<T> {
 
 #[derive(Debug, Default)]
 #[repr(transparent)]
+/// An untyped resource-path token (`ResRef` in REDscript).
+///
+/// Like [`RaRef`], this identifies an archive resource without loading it.
+/// Use it for script APIs expecting `ResRef` rather than a typed `raRef<T>`.
+///
+/// SDK: [ResRef](https://github.com/WopsS/RED4ext.SDK/blob/2216befc23924b46996a9335043aebb31ba6a757/include/RED4ext/Scripting/Natives/Generated/red/ResourceReferenceScriptToken.hpp).
 pub struct ResRef(red::ResRef);
 
 impl ResRef {
+    /// Creates a token from an archive-relative path using [`RaRef::new`]'s
+    /// normalization and validation rules. Does not check resource existence.
     pub fn new(path: impl AsRef<Path>) -> Result<Self, ResourcePathError> {
         Ok(Self(red::ResRef {
             resource: red::RaRef {
@@ -138,21 +157,27 @@ fn encode_path(path: impl AsRef<Path>) -> Result<u64, ResourcePathError> {
     Ok(fnv1a64(sanitized.as_bytes()))
 }
 
+/// A resource path could not be normalized into a valid archive path.
 #[derive(Debug, Error)]
 pub enum ResourcePathError {
+    /// No path components remain after normalization.
     #[error("resource path should not be empty")]
     Empty,
+    /// The normalized path exceeds [`MAX_LENGTH`] UTF-8 bytes.
     #[error("resource path should be less than {} characters", self::MAX_LENGTH)]
     TooLong,
+    /// The path contains components other than normal archive names, such as `..`.
     #[error(
         "resource path should be an absolute canonical path in an archive e.g. 'base\\mod\\character.ent'"
     )]
     NotCanonical,
+    /// The input path cannot be represented as UTF-8.
     #[error("resource path should be valid UTF-8")]
     InvalidUnicode,
 }
 
-/// shortcut for ResRef creation.
+/// Creates a [`ResRef`](crate::types::ResRef) from slash-separated path literals,
+/// returning a `Result` from path validation.
 #[macro_export]
 macro_rules! res_ref {
     ($base:expr, /$lit:literal $($tt:tt)*) => {
@@ -170,16 +195,47 @@ macro_rules! res_ref {
 
 #[derive(Debug)]
 #[repr(transparent)]
+/// A resource path with a shared loading token for resource type `T`.
+///
+/// Unlike [`RaRef`], this can retain a resource's loading state and loaded handle.
+/// Nonempty references must be dropped while the game's resource systems are available.
+/// Loading and resource access are not currently exposed by this wrapper.
+///
+/// SDK: [ResourceReference](https://github.com/WopsS/RED4ext.SDK/blob/2216befc23924b46996a9335043aebb31ba6a757/include/RED4ext/ResourceReference.hpp).
 pub struct ResourceRef<T>(red::ResourceReference<T>);
+
+impl<T> Drop for ResourceRef<T> {
+    fn drop(&mut self) {
+        // SAFETY: This transparent wrapper owns one SDK resource reference. The
+        // bridge uses the pinned SDK's T-independent token/handle destruction
+        // ABI (documented in deps/bridge/README.md), including its allocators.
+        unsafe {
+            crate::raw::root::red4ext_rs_destroy_resource_ref(
+                std::ptr::from_mut(&mut self.0).cast(),
+            );
+        }
+    }
+}
 
 #[derive(Debug, Default, Copy, Clone)]
 #[repr(transparent)]
+/// An opaque engine message resource path for native API interoperability.
+///
+/// SDK: [MessageResourcePath](https://github.com/WopsS/RED4ext.SDK/blob/2216befc23924b46996a9335043aebb31ba6a757/include/RED4ext/NativeTypes.hpp).
 pub struct MessageResourcePath(red::MessageResourcePath);
 
 #[cfg(test)]
 mod tests {
-    use super::{ResRef, encode_path};
+    use super::{ResRef, ResourceRef, encode_path};
     use crate::fnv1a64;
+
+    #[test]
+    fn empty_resource_ref_drop() {
+        // A default SDK reference has a null token and needs no game systems.
+        let resource = ResourceRef::<u8>(Default::default());
+        assert_eq!(std::mem::size_of_val(&resource), 0x18);
+        drop(resource);
+    }
 
     #[test]
     fn resource_path() {

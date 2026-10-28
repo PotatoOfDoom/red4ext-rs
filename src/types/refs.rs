@@ -10,25 +10,41 @@ use crate::systems::RttiSystem;
 use crate::types::PtrEq;
 use crate::{ClassKind, VoidPtr};
 
-/// A reference counted shared pointer to a script class.
+/// A strong, reference-counted handle to a class instance (`ref<T>` in REDscript).
+///
+/// Cloning shares the same instance rather than copying its fields. A default
+/// handle is null; a non-null handle keeps its instance alive until the last
+/// strong handle is dropped. Use [`WeakRef`] to refer to an instance without
+/// keeping it alive.
+///
+/// Unlike [`ScriptRef`], this owns a share of the instance. Field access is unsafe
+/// because the engine and other handles may access the same data.
+///
+/// SDK: [Handle](https://github.com/WopsS/RED4ext.SDK/blob/2216befc23924b46996a9335043aebb31ba6a757/include/RED4ext/Handle.hpp).
 #[repr(transparent)]
 pub struct Ref<T: ScriptClass>(BaseRef<NativeType<T>>);
 
 impl<T: ScriptClass> Ref<T> {
-    /// Creates a new reference to the class.
+    /// Allocates and constructs an instance of `T` through engine RTTI.
+    ///
+    /// Returns `None` if the class is not registered or no instance is available.
+    /// Requires initialized engine RTTI and allocators.
     #[inline]
     pub fn new() -> Option<Self> {
         Self::new_with(|_| {})
     }
 
-    /// Creates a new reference to the class and initializes it with the provided function.
+    /// Constructs an instance as in [`Self::new`], then initializes its fields.
+    /// The callback runs before the new handle is returned.
     pub fn new_with(init: impl FnOnce(&mut T)) -> Option<Self> {
         let system = RttiSystem::get();
         let class = system.get_class(CName::new(T::NAME))?;
         let mut this = Self::default();
         Self::ctor(&mut this, class.instantiate().as_ptr().cast::<T>());
 
-        init(T::Kind::fields_mut(this.0.instance_mut()?));
+        // The unsafe ScriptClass implementation supplies the field layout; this
+        // newly constructed instance has not escaped to another Rust handle.
+        init(unsafe { T::Kind::fields_mut(this.0.instance_mut()?) });
         Some(this)
     }
 
@@ -39,46 +55,49 @@ impl<T: ScriptClass> Ref<T> {
         }
     }
 
-    /// Returns a reference to the fields of the class.
+    /// Borrows `T`'s fields, or returns `None` for a null handle.
+    /// For scripted classes these are separate from the native instance.
     ///
     /// # Safety
-    /// The underlying value can be accessed mutably at any point through another copy of the
-    /// [`Ref`]. Ideally, the caller should ensure that the returned reference is short-lived.
+    /// Prevent mutation through the engine or other handles for the entire borrow.
     #[inline]
     pub unsafe fn fields(&self) -> Option<&T> {
-        Some(T::Kind::fields(self.0.instance()?))
+        Some(unsafe { T::Kind::fields(self.0.instance()?) })
     }
 
-    /// Returns a mutable reference to the fields of the class.
+    /// Mutably borrows `T`'s fields, or returns `None` for a null handle.
     ///
     /// # Safety
-    /// The underlying value can be accessed mutably at any point through another copy of the
-    /// [`Ref`]. Ideally, the caller should ensure that the returned reference is short-lived.
+    /// Ensure exclusive access: no engine or other handle may read or write these
+    /// fields for the entire borrow.
     #[inline]
     pub unsafe fn fields_mut(&mut self) -> Option<&mut T> {
-        Some(T::Kind::fields_mut(self.0.instance_mut()?))
+        Some(unsafe { T::Kind::fields_mut(self.0.instance_mut()?) })
     }
 
-    /// Returns a reference to the instance of the class.
+    /// Borrows the native instance, or returns `None` for a null handle.
+    /// For scripted classes this is the native base, not the scripted fields.
     ///
     /// # Safety
-    /// The underlying value can be accessed mutably at any point through another copy of the
-    /// [`Ref`]. Ideally, the caller should ensure that the returned reference is short-lived.
+    /// Prevent mutation through the engine or other handles for the entire borrow.
     #[inline]
     pub unsafe fn instance(&self) -> Option<&NativeType<T>> {
         self.0.instance()
     }
 
-    /// Converts the reference to a [`WeakRef`]. This will decrement the strong reference count
-    /// and increment the weak reference count.
+    /// Consumes this strong handle and returns a weak handle to the same instance.
+    ///
+    /// If this was the last strong handle, the instance is destroyed and the
+    /// returned weak handle cannot be upgraded. Clone first to retain ownership.
     #[inline]
     pub fn downgrade(self) -> WeakRef<T> {
         self.0.inc_weak();
         WeakRef(self.0.clone())
     }
 
-    /// Attempts to cast the reference to a reference of another class.
-    /// Returns [`None`] if the target class is not compatible.
+    /// Consumes this handle and checks the instance's runtime class before casting.
+    /// Returns `None` for a null handle or if the instance is not `U` or a subclass
+    /// of `U`. A failed cast drops this handle.
     pub fn cast<U>(self) -> Option<Ref<U>>
     where
         U: ScriptClass,
@@ -93,6 +112,7 @@ impl<T: ScriptClass> Ref<T> {
         self.0.0.instance.is_null()
     }
 
+    /// Returns whether the runtime class is exactly `U`; false for a null handle.
     #[inline]
     pub fn is_exactly_a<U>(&self) -> bool
     where
@@ -102,6 +122,7 @@ impl<T: ScriptClass> Ref<T> {
             .is_some_and(ISerializable::is_exactly_a::<U>)
     }
 
+    /// Returns whether the instance is `U` or a subclass of `U`; false if null.
     #[inline]
     pub fn is_a<U>(&self) -> bool
     where
@@ -154,14 +175,20 @@ impl<T: ScriptClass> Drop for Ref<T> {
 unsafe impl<T: ScriptClass> Send for Ref<T> {}
 unsafe impl<T: ScriptClass> Sync for Ref<T> {}
 
-/// A weak reference to a script class.
-/// Before use, it must be upgraded to a strong reference using [`WeakRef::upgrade`].
+/// A weak handle to a class instance (`wref<T>` in REDscript).
+///
+/// Does not keep the instance alive. [`Self::upgrade`] obtains a strong [`Ref`]
+/// only while the instance still exists. Cloning copies the weak handle;
+/// a default weak handle is empty.
+///
+/// SDK: [WeakHandle](https://github.com/WopsS/RED4ext.SDK/blob/2216befc23924b46996a9335043aebb31ba6a757/include/RED4ext/Handle.hpp).
 #[repr(transparent)]
 pub struct WeakRef<T: ScriptClass>(BaseRef<NativeType<T>>);
 
 impl<T: ScriptClass> WeakRef<T> {
-    /// Attempts to upgrade the weak reference to a strong reference.
-    /// Returns [`None`] if the strong reference count is zero.
+    /// Consumes this weak handle and obtains a strong handle if the instance is alive.
+    /// Returns `None` for an empty handle or an instance with no strong handles.
+    /// Clone first if you want to keep the weak handle.
     #[inline]
     pub fn upgrade(self) -> Option<Ref<T>> {
         self.0.inc_strong_if_non_zero().then(|| Ref(self.0.clone()))
@@ -224,8 +251,10 @@ impl<T> BaseRef<T> {
 
     #[inline]
     fn inc_strong(&self) {
+        // Match the SDK's unsuffixed Windows Interlocked operations, including
+        // their full barriers before promotion and final destruction.
         if let Some(cnt) = self.ref_count() {
-            cnt.strong().fetch_add(1, Ordering::Relaxed);
+            cnt.strong().fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -235,7 +264,7 @@ impl<T> BaseRef<T> {
         };
 
         cnt.strong()
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |x| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |x| {
                 (x != 0).then(|| x + 1)
             })
             .is_ok()
@@ -246,7 +275,7 @@ impl<T> BaseRef<T> {
             return false;
         };
 
-        if cnt.strong().fetch_sub(1, Ordering::Relaxed) == 1 {
+        if cnt.strong().fetch_sub(1, Ordering::SeqCst) == 1 {
             self.dec_weak();
             true
         } else {
@@ -257,7 +286,7 @@ impl<T> BaseRef<T> {
     #[inline]
     fn inc_weak(&self) {
         if let Some(cnt) = self.ref_count() {
-            cnt.weak_refs().fetch_add(1, Ordering::Relaxed);
+            cnt.weak_refs().fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -318,25 +347,71 @@ impl RefCount {
     }
 }
 
-/// A reference to local script data.
+#[cfg(test)]
+mod count_tests {
+    use super::*;
+
+    fn with_count(strong: u32, weak: u32) -> (Box<red::RefCnt>, BaseRef<()>) {
+        let mut count = Box::new(red::RefCnt {
+            strongRefs: strong,
+            weakRefs: weak,
+        });
+        let base = BaseRef(red::SharedPtrBase {
+            instance: ptr::null_mut(),
+            refCount: &mut *count,
+            ..Default::default()
+        });
+        (count, base)
+    }
+
+    #[test]
+    fn counts_match_sdk_transitions_without_final_release() {
+        let (count, mut base) = with_count(1, 1);
+        base.inc_strong();
+        assert_eq!(count.strongRefs, 2);
+        assert!(base.inc_strong_if_non_zero());
+        assert_eq!(count.strongRefs, 3);
+        assert!(!base.dec_strong());
+        assert_eq!(count.strongRefs, 2);
+        base.inc_weak();
+        assert_eq!(count.weakRefs, 2);
+    }
+
+    #[test]
+    fn promotion_never_revives_dead_or_empty_counts() {
+        let (count, base) = with_count(0, 1);
+        assert!(!base.inc_strong_if_non_zero());
+        assert_eq!(count.strongRefs, 0);
+        assert!(!BaseRef::<()>::default().inc_strong_if_non_zero());
+    }
+}
+
+/// A typed borrow of an existing value (`script_ref<T>` in REDscript).
+///
+/// Used to pass a value by reference to script functions. Unlike [`Ref`], it
+/// neither allocates an instance nor uses reference counting. The original
+/// value stays borrowed for `'a` and must not be retained by the called script.
+///
+/// SDK: [ScriptRef](https://github.com/WopsS/RED4ext.SDK/blob/2216befc23924b46996a9335043aebb31ba6a757/include/RED4ext/NativeTypes.hpp).
 #[derive(Debug)]
 #[repr(transparent)]
 pub struct ScriptRef<'a, T>(red::ScriptRef<T>, PhantomData<&'a mut T>);
 
 impl<'a, T: NativeRepr> ScriptRef<'a, T> {
-    /// Creates a new reference pointing to the provided value.
+    /// Borrows a value and records its RTTI type.
+    /// Returns `None` if `T` is not registered; requires initialized engine RTTI.
     pub fn new(val: &'a mut T) -> Option<Self> {
         let rtti = RttiSystem::get();
         let inner = rtti.get_type(CName::new(T::NAME))?;
         let ref_ = red::ScriptRef {
-            innerType: inner.as_raw() as *const _ as *mut red::CBaseRTTIType,
+            innerType: inner.as_raw() as *const _ as *mut red::rtti::IType,
             ref_: val as *mut T,
             ..Default::default()
         };
         Some(Self(ref_, PhantomData))
     }
 
-    /// Returns the value being referenced.
+    /// Borrows the referenced value, or returns `None` if the reference is undefined.
     #[inline]
     pub fn value(&self) -> Option<&T> {
         unsafe { self.0.ref_.as_ref() }

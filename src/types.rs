@@ -1,3 +1,7 @@
+//! SDK-compatible values, containers, and borrowed engine views.
+//!
+//! Engine-backed allocation and singleton access require initialized game systems.
+
 mod allocator;
 mod array;
 mod buffer;
@@ -57,10 +61,12 @@ pub use sync::{RwSpinLockReadGuard, RwSpinLockWriteGuard};
 pub use time::{DateTime, EngineTime, GameTime};
 pub use variant::Variant;
 
+/// Compares native instance addresses rather than pointed-to values.
 pub trait PtrEq<Rhs = Self>
 where
     Rhs: ?Sized,
 {
+    /// Returns whether both wrappers point to the same native instance.
     fn ptr_eq(&self, other: &Rhs) -> bool;
 }
 

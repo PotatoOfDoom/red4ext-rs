@@ -2,11 +2,17 @@ use std::hash::Hash;
 
 use crate::raw::root::RED4ext as red;
 
+/// Game-clock seconds.
+/// Rust addition and subtraction methods saturate at the `u32` bounds.
+///
+/// SDK: [GameTime](https://github.com/WopsS/RED4ext.SDK/blob/2216befc23924b46996a9335043aebb31ba6a757/include/RED4ext/Scripting/Natives/GameTime.hpp).
 #[derive(Default, Clone, Copy)]
 #[repr(transparent)]
 pub struct GameTime(red::GameTime);
 
 impl GameTime {
+    /// Sums time components, saturating at `u32::MAX` seconds.
+    /// Components need not be restricted to clock ranges such as 0–23 hours.
     pub fn new(days: u32, hours: u32, minutes: u32, seconds: u32) -> Self {
         let mut this = Self::default();
         this.add_days(days);
@@ -16,6 +22,7 @@ impl GameTime {
         this
     }
 
+    /// Adds 24-hour days, saturating at `u32::MAX` seconds.
     pub fn add_days(&mut self, days: u32) {
         self.0.seconds = self.0.seconds.saturating_add(
             days.saturating_mul(24)
@@ -24,6 +31,7 @@ impl GameTime {
         );
     }
 
+    /// Adds hours, saturating at `u32::MAX` seconds.
     pub fn add_hours(&mut self, hours: u32) {
         self.0.seconds = self
             .0
@@ -31,14 +39,17 @@ impl GameTime {
             .saturating_add(hours.saturating_mul(60).saturating_mul(60));
     }
 
+    /// Adds minutes, saturating at `u32::MAX` seconds.
     pub fn add_minutes(&mut self, minutes: u32) {
         self.0.seconds = self.0.seconds.saturating_add(minutes.saturating_mul(60));
     }
 
+    /// Adds seconds, saturating at `u32::MAX`.
     pub fn add_seconds(&mut self, seconds: u32) {
         self.0.seconds = self.0.seconds.saturating_add(seconds);
     }
 
+    /// Subtracts 24-hour days, saturating at zero seconds.
     pub fn sub_days(&mut self, days: u32) {
         self.0.seconds = self.0.seconds.saturating_sub(
             days.saturating_mul(24)
@@ -47,6 +58,7 @@ impl GameTime {
         );
     }
 
+    /// Subtracts hours, saturating at zero seconds.
     pub fn sub_hours(&mut self, hours: u32) {
         self.0.seconds = self
             .0
@@ -54,26 +66,32 @@ impl GameTime {
             .saturating_sub(hours.saturating_mul(60).saturating_mul(60));
     }
 
+    /// Subtracts minutes, saturating at zero seconds.
     pub fn sub_minutes(&mut self, minutes: u32) {
         self.0.seconds = self.0.seconds.saturating_sub(minutes.saturating_mul(60));
     }
 
+    /// Subtracts seconds, saturating at zero.
     pub fn sub_seconds(&mut self, seconds: u32) {
         self.0.seconds = self.0.seconds.saturating_sub(seconds);
     }
 
+    /// Returns the total number of complete 24-hour days, starting at zero.
     pub fn day(&self) -> u32 {
         unsafe { self.0.GetDay() }
     }
 
+    /// Returns the hour within the current day (0–23).
     pub fn hour(&self) -> u32 {
         unsafe { self.0.GetHour() }
     }
 
+    /// Returns the minute within the current hour (0–59).
     pub fn minute(&self) -> u32 {
         unsafe { self.0.GetMinute() }
     }
 
+    /// Returns the second within the current minute (0–59).
     pub fn second(&self) -> u32 {
         unsafe { self.0.GetSecond() }
     }
@@ -130,6 +148,7 @@ impl From<GameTime> for u32 {
     }
 }
 
+/// Extracts the time of day, discarding complete days.
 #[cfg(feature = "time")]
 impl TryFrom<GameTime> for time::Time {
     type Error = time::error::ComponentRange;
@@ -197,6 +216,8 @@ impl std::ops::SubAssign<time::Time> for GameTime {
     }
 }
 
+/// Returns the epoch used by the Chrono conversions: 2077-04-16 01:24:00
+/// in the US Pacific time zone. Available with the `chrono` feature.
 #[cfg(feature = "chrono")]
 pub fn cyberpunk_epoch() -> chrono::DateTime<chrono_tz::Tz> {
     use chrono::TimeZone;
@@ -217,6 +238,9 @@ impl From<GameTime> for chrono::DateTime<chrono::Utc> {
     }
 }
 
+/// Converts elapsed seconds since 2077-04-16 01:24:00 US Pacific time,
+/// discarding subseconds.
+/// Returns `OutOfRange` before the epoch or beyond `u32::MAX` whole seconds.
 #[cfg(feature = "chrono")]
 impl TryFrom<chrono::DateTime<chrono::Utc>> for GameTime {
     type Error = chrono::format::ParseErrorKind;
@@ -225,9 +249,9 @@ impl TryFrom<chrono::DateTime<chrono::Utc>> for GameTime {
         if value < cyberpunk_epoch() {
             return Err(chrono::format::ParseErrorKind::OutOfRange);
         }
-        Ok(Self::from(
-            (value.timestamp() - cyberpunk_epoch().timestamp()) as u32,
-        ))
+        let seconds = u32::try_from(value.timestamp() - cyberpunk_epoch().timestamp())
+            .map_err(|_| chrono::format::ParseErrorKind::OutOfRange)?;
+        Ok(Self::from(seconds))
     }
 }
 
@@ -276,7 +300,7 @@ impl chrono::Timelike for GameTime {
         None
     }
 
-    /// GameTime does not support nanoseconds, so it will always return `None`
+    /// Always returns `None`, even for zero: game time has no subsecond component.
     fn with_nanosecond(&self, _: u32) -> Option<Self> {
         None
     }
@@ -342,6 +366,24 @@ mod tests {
         assert_eq!(gt.hour(), 0);
         assert_eq!(gt.minute(), 7);
         assert_eq!(gt.second(), 7);
+    }
+
+    #[test]
+    #[cfg(feature = "chrono")]
+    fn date_bounds() {
+        use chrono::Duration;
+
+        let epoch = super::cyberpunk_epoch().to_utc();
+        assert!(GameTime::try_from(epoch - Duration::seconds(1)).is_err());
+        assert_eq!(u32::from(GameTime::try_from(epoch).unwrap()), 0);
+        let last = epoch + Duration::seconds(u32::MAX as i64);
+        assert_eq!(u32::from(GameTime::try_from(last).unwrap()), u32::MAX);
+        assert!(GameTime::try_from(last + Duration::seconds(1)).is_err());
+        // Preserve the existing truncation of subsecond precision.
+        assert_eq!(
+            u32::from(GameTime::try_from(epoch + Duration::milliseconds(999)).unwrap()),
+            0
+        );
     }
 
     #[test]

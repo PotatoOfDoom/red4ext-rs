@@ -1,8 +1,11 @@
 use std::hash::Hash;
 
+use crate::NativeRepr;
 use crate::raw::root::RED4ext as red;
-use crate::{NativeRepr, fnv1a64_step};
 
+/// Hashed world-node path.
+///
+/// SDK: [NodeRef](https://github.com/WopsS/RED4ext.SDK/blob/2216befc23924b46996a9335043aebb31ba6a757/include/RED4ext/NodeRef.hpp).
 #[derive(Debug, Clone, Copy)]
 #[repr(transparent)]
 pub struct NodeRef(red::NodeRef);
@@ -12,18 +15,22 @@ unsafe impl NativeRepr for NodeRef {
 }
 
 impl NodeRef {
+    /// Returns whether the hash is nonzero; does not check whether a node exists.
     #[inline]
     pub const fn is_defined(self) -> bool {
         self.0.hash != 0
     }
 
-    /// Creates a new `NodeRef` from the given string.
-    /// This function just calculates the hash of the string using the FNV-1a algorithm.
+    /// Hashes a node path without resolving it or accessing the engine.
+    /// Skips `#` characters and `;` suffixes up to the next `/` or NUL, and stops
+    /// at the first NUL. Empty paths produce the undefined (zero) hash.
     #[inline]
     pub const fn new(name: &str) -> Self {
         Self::from_bytes(name.as_bytes())
     }
 
+    /// Hashes path bytes with the same rules as [`Self::new`], without UTF-8 validation.
+    /// Non-ASCII bytes use the SDK's signed MSVC `char` semantics.
     pub const fn from_bytes(mut tail: &[u8]) -> Self {
         const SEED: u64 = 0xCBF2_9CE4_8422_2325;
 
@@ -31,13 +38,17 @@ impl NodeRef {
         while let [byte, t @ ..] = tail {
             tail = t;
 
+            if *byte == 0 {
+                break;
+            }
+
             if *byte == b'#' {
                 continue;
             }
 
             if *byte == b';' {
                 while let [next, t @ ..] = tail {
-                    if *next == b'/' {
+                    if *next == 0 || *next == b'/' {
                         break;
                     }
                     tail = t;
@@ -45,7 +56,8 @@ impl NodeRef {
                 continue;
             }
 
-            hash = fnv1a64_step(hash, *byte);
+            // The SDK XOR promotes signed char to uint64_t (MSVC default).
+            hash = (hash ^ (*byte as i8 as u64)).wrapping_mul(0x100_0000_01B3);
         }
 
         if hash == SEED {
@@ -103,6 +115,18 @@ impl From<NodeRef> for u64 {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn sdk_c_string_hashing() {
+        assert_eq!(NodeRef::from_bytes(b"abc\0def"), NodeRef::new("abc"));
+        assert_eq!(NodeRef::from_bytes(b"abc;alias\0/def"), NodeRef::new("abc"));
+        assert_eq!(NodeRef::from_bytes(b"\0abc"), NodeRef::default());
+        assert_eq!(NodeRef::new("#;alias"), NodeRef::default());
+        assert_eq!(NodeRef::new("a;alias/#b"), NodeRef::new("a/b"));
+        let expected = (0xCBF2_9CE4_8422_2325_u64 ^ u64::MAX).wrapping_mul(0x100_0000_01B3);
+        assert_eq!(u64::from(NodeRef::from_bytes(&[0xFF])), expected);
+        assert_eq!(NodeRef::new("é"), NodeRef::from_bytes(&[0xC3, 0xA9]));
+    }
 
     #[test]
     fn calculate_hashes() {

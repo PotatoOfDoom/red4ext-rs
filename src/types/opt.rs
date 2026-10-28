@@ -1,15 +1,16 @@
 use std::fmt;
 
-/// A convenience type to explicitly mark
-/// a function argument as `opt T`.
+/// Rust adapter for REDscript `opt T` parameters.
+/// Omitted arguments use `T::default()`, so omission and an explicit default value
+/// cannot be distinguished during representation conversion. Comparisons and
+/// display treat [`Opt::Default`] as `T::default()`.
 ///
-/// When left unspecified on Redscript side,
-/// it translates to its `Default` representation.
+/// SDK: [parameter flags](https://github.com/WopsS/RED4ext.SDK/blob/2216befc23924b46996a9335043aebb31ba6a757/include/RED4ext/Scripting/CProperty.hpp).
 #[derive(Default, Debug, Clone, Copy)]
 pub enum Opt<T> {
-    /// Value is specified and guaranteed to be non-`Default` value.
+    /// Explicit value. Direct construction does not enforce a non-default value.
     NonDefault(T),
-    /// `Default` value.
+    /// Uses `T::default()` when converted to an engine representation.
     #[default]
     Default,
 }
@@ -27,6 +28,8 @@ where
 }
 
 impl<T> Opt<T> {
+    /// Returns the explicit value, or `None` for [`Opt::Default`].
+    /// Unlike comparisons, this preserves an explicitly stored default value.
     pub fn into_option(self) -> Option<T> {
         match self {
             Self::NonDefault(x) => Some(x),
@@ -39,6 +42,7 @@ impl<T> Opt<T>
 where
     T: Default,
 {
+    /// Returns the explicit value, or `T::default()` for [`Opt::Default`].
     pub fn unwrap_or_default(self) -> T {
         match self {
             Self::NonDefault(x) => x,
@@ -49,12 +53,12 @@ where
 
 impl<T> fmt::Display for Opt<T>
 where
-    T: fmt::Display,
+    T: fmt::Display + Default,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NonDefault(x) => write!(f, "{x}"),
-            Self::Default => write!(f, "{}", <Self as Default>::default()),
+            Self::Default => write!(f, "{}", T::default()),
         }
     }
 }
@@ -126,6 +130,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::Opt;
+
+    #[test]
+    fn display() {
+        assert_eq!(Opt::<i32>::Default.to_string(), "0");
+        assert_eq!(Opt::NonDefault(42).to_string(), "42");
+        assert_eq!(Opt::<String>::Default.to_string(), "");
+    }
 
     #[test]
     fn transitivity() {

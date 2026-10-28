@@ -13,13 +13,16 @@ use crate::types::{
 };
 use crate::{ScriptClass, VoidPtr};
 
-/// An error returned when invoking a function fails.
+/// A reflected call could not be resolved, type-checked, or executed.
 #[derive(Debug, Error)]
 pub enum InvokeError {
+    /// No global or static function has the requested full RTTI name.
     #[error("function could not be found by full name '{0}'")]
     FunctionNotFound(&'static str),
+    /// The requested class could not be resolved.
     #[error("class could not be found by name '{0}'")]
     ClassNotFound(&'static str),
+    /// No instance method matches the name; includes candidate method names.
     #[error(
         "method could not be found by full name '{0}', available options: {options}",
         options = .1.iter()
@@ -34,26 +37,39 @@ pub enum InvokeError {
             })
     )]
     MethodNotFound(&'static str, Box<[CName]>),
+    /// The argument count differs from the reflected signature.
     #[error("invalid number of arguments, expected {expected} for {function}")]
     InvalidArgCount {
+        /// The function's RTTI name.
         function: &'static str,
+        /// The number of parameters in the reflected signature.
         expected: u32,
     },
+    /// An argument's engine type differs from the reflected parameter type.
     #[error("expected '{expected}' argument type at index {index} for '{function}'")]
     ArgMismatch {
+        /// The function's RTTI name.
         function: &'static str,
+        /// The parameter's engine RTTI type name.
         expected: &'static str,
+        /// The zero-based argument index.
         index: usize,
     },
+    /// The requested return type differs from the reflected return type.
     #[error("return type mismatch, expected '{expected}' for '{function}'")]
     ReturnMismatch {
+        /// The function's RTTI name.
         function: &'static str,
+        /// The reflected return type's RTTI name, or `Void`.
         expected: &'static str,
     },
+    /// An argument or return type is not registered in engine RTTI.
     #[error("could not resolve type {0}")]
     UnresolvedType(&'static str),
+    /// The engine reported that execution failed.
     #[error("execution of '{0}' has failed")]
     ExecutionFailed(&'static str),
+    /// The instance receiver is a null reference to the named class.
     #[error("the 'this' pointer for class '{0}' was null")]
     NullReceiver(&'static str),
 }
@@ -73,12 +89,22 @@ impl InvokeError {
     }
 }
 
-/// A trait for functions that can be exported as global functions.
+/// Rust functions exportable as global functions or static methods.
+/// Arguments use [`FromRepr`]; return values use [`IntoRepr`].
+/// Normally used through [`global!`](crate::global), not called directly.
 #[sealed]
 pub trait GlobalInvocable<A, R> {
+    /// The argument and return types exposed to engine RTTI.
     const FN_TYPE: FunctionType;
 
-    fn invoke(self, ctx: &IScriptable, frame: &mut StackFrame, ret: Option<&mut MaybeUninit<R>>);
+    /// Reads arguments from a matching engine stack frame and calls the function.
+    /// Writes the result when return storage is provided; `ctx` may be null.
+    fn invoke(
+        self,
+        ctx: *mut IScriptable,
+        frame: &mut StackFrame,
+        ret: Option<&mut MaybeUninit<R>>,
+    );
 }
 
 macro_rules! impl_global_invocable {
@@ -98,7 +124,7 @@ macro_rules! impl_global_invocable {
                 };
 
                 #[inline]
-                fn invoke(self, _ctx: &IScriptable, frame: &mut StackFrame, ret: Option<&mut MaybeUninit<R::Repr>>) {
+                fn invoke(self, _ctx: *mut IScriptable, frame: &mut StackFrame, ret: Option<&mut MaybeUninit<R::Repr>>) {
                     $(let $types = unsafe { frame.get_arg::<$types>() };)*
                     let res = self($($types,)*);
                     if let Some(ret) = ret {
@@ -139,7 +165,7 @@ macro_rules! impl_global_invocable_with_ref {
                 };
 
                 #[inline]
-                fn invoke(self, _ctx: &IScriptable, frame: &mut StackFrame, ret: Option<&mut MaybeUninit<R::Repr>>) {
+                fn invoke(self, _ctx: *mut IScriptable, frame: &mut StackFrame, ret: Option<&mut MaybeUninit<R::Repr>>) {
                     let this = unsafe { frame.get_arg() };
                     $(let $types = unsafe { frame.get_arg::<$types>() };)*
                     let res = self(this, $($types,)*);
@@ -162,11 +188,16 @@ impl_global_invocable_with_ref!(
     (A, B, C, D, E, F)
 );
 
-/// A trait for functions that can be exported as class methods.
+/// Rust functions exportable as native instance methods with a shared receiver.
+/// Arguments use [`FromRepr`]; return values use [`IntoRepr`].
+/// Normally used through [`method!`](crate::method), not called directly.
 #[sealed]
 pub trait MethodInvocable<Ctx, A, R> {
+    /// The argument and return types exposed to engine RTTI, excluding the receiver.
     const FN_TYPE: FunctionType;
 
+    /// Reads arguments from a matching engine stack frame and calls the method on `ctx`.
+    /// Writes the result when return storage is provided.
     fn invoke(self, ctx: &Ctx, frame: &mut StackFrame, ret: Option<&mut MaybeUninit<R>>);
 }
 
@@ -210,7 +241,10 @@ impl_method_invocable!(
     (A, B, C, D, E, F, G)
 );
 
-/// A representation of a function type, including its arguments and return type.
+/// Engine RTTI argument and return types inferred from an exportable Rust function.
+/// Describes the signature registered with engine functions.
+///
+/// SDK: [Functions](https://github.com/WopsS/RED4ext.SDK/blob/2216befc23924b46996a9335043aebb31ba6a757/include/RED4ext/Scripting/Functions.hpp).
 #[derive(Debug)]
 pub struct FunctionType {
     args: &'static [CName],
@@ -226,7 +260,7 @@ impl FunctionType {
     }
 }
 
-/// A representation of a global function, including its name, a function handler, and its type.
+/// A global function or static method definition, created with [`global!`](crate::global).
 #[derive(Debug)]
 pub struct GlobalMetadata {
     name: &'static CStr,
@@ -249,8 +283,8 @@ impl GlobalMetadata {
         }
     }
 
-    /// Converts this metadata into a [`GlobalFunction`] instance, which can be registered with
-    /// [RttiSystemMut](crate::RttiSystemMut).
+    /// Creates a global RTTI function without registering it.
+    /// Requires initialized engine RTTI and registered argument and return types.
     pub fn to_rtti(&self) -> PoolRef<GlobalFunction> {
         let mut flags = FunctionFlags::default();
         flags.set_is_native(true);
@@ -261,8 +295,8 @@ impl GlobalMetadata {
         func
     }
 
-    /// Converts this metadata into a [`StaticMethod`] instance, which can be registered with
-    /// [RttiSystemMut](crate::RttiSystemMut).
+    /// Creates a static RTTI method for `class` without adding it to the class.
+    /// Requires initialized engine RTTI and registered argument and return types.
     pub fn to_rtti_static_method(&self, class: &Class) -> PoolRef<StaticMethod> {
         let mut flags = FunctionFlags::default();
         flags.set_is_native(true);
@@ -275,7 +309,7 @@ impl GlobalMetadata {
     }
 }
 
-/// A representation of a class method, including its name, a function handler, and its type.
+/// A native instance-method definition, created with [`method!`](crate::method).
 #[derive(Debug)]
 pub struct MethodMetadata<Ctx> {
     name: &'static CStr,
@@ -286,7 +320,8 @@ pub struct MethodMetadata<Ctx> {
     is_final: bool,
 }
 
-impl<Ctx: ScriptClass> MethodMetadata<Ctx> {
+// Instance handlers receive the native object, never scripted field storage.
+impl<Ctx: ScriptClass<Kind = crate::class_kind::Native>> MethodMetadata<Ctx> {
     #[doc(hidden)]
     #[inline]
     pub const fn new<F: MethodInvocable<Ctx, A, R>, A, R>(
@@ -316,8 +351,9 @@ impl<Ctx: ScriptClass> MethodMetadata<Ctx> {
         self
     }
 
-    /// Converts this metadata into a [`Method`] instance, which can be registered with
-    /// the [RttiSystemMut](crate::RttiSystemMut).
+    /// Creates an RTTI method for `class` without adding it to the class.
+    /// `class` must describe `Ctx`. Requires initialized engine RTTI and registered
+    /// argument and return types.
     pub fn to_rtti(&self, class: &Class) -> PoolRef<Method> {
         let mut flags = FunctionFlags::default();
         flags.set_is_native(true);
@@ -330,8 +366,9 @@ impl<Ctx: ScriptClass> MethodMetadata<Ctx> {
     }
 }
 
-/// A macro for defining global functions. Usually used in conjunction with the
-/// [`exports!`](crate::exports) macro.
+/// Creates metadata for a global function or static method.
+/// The name is a C string literal such as `c"Adder"`; register globals with
+/// [`GlobalExport`](crate::GlobalExport) in [`exports!`](crate::exports).
 ///
 /// # Example
 /// ```rust
@@ -348,13 +385,13 @@ impl<Ctx: ScriptClass> MethodMetadata<Ctx> {
 #[macro_export]
 macro_rules! global {
     ($name:literal, $fun:expr) => {{
-        extern "C" fn native_impl(
-            ctx: &$crate::types::IScriptable,
+        unsafe extern "C" fn native_impl(
+            ctx: *mut $crate::types::IScriptable,
             frame: &mut $crate::types::StackFrame,
             ret: $crate::VoidPtr,
             _unk: i64,
         ) {
-            let out = unsafe { std::mem::transmute(ret) };
+            let out = unsafe { (ret as *mut ::std::mem::MaybeUninit<_>).as_mut() };
             $crate::GlobalInvocable::invoke($fun, ctx, frame, out);
             unsafe { frame.step() };
         }
@@ -363,18 +400,35 @@ macro_rules! global {
     }};
 }
 
-/// A macro for defining class methods. Usually used in conjunction with the
+/// Creates metadata for an instance method on a native [`ScriptClass`].
+/// The method takes `&self`; use interior mutability for field changes.
+/// Prefix the name with `event` or `final` to set the corresponding method flag.
+/// Scripted field layouts cannot be used as native instance headers.
+///
+/// ```compile_fail
+/// use red4ext_rs::{ScriptClass, class_kind, method};
+/// struct Fields;
+/// unsafe impl ScriptClass for Fields {
+///     type Kind = class_kind::Scripted;
+///     const NAME: &'static str = "Fields";
+/// }
+/// impl Fields { fn value(&self) -> i32 { 1 } }
+/// let _ = method!(c"Value", Fields::value);
+/// ```
+/// Usually used in conjunction with the
 /// [`methods!`](crate::methods) macro.
 #[macro_export]
 macro_rules! method {
     ($name:literal, $ty:ident::$id:ident $($mods:ident)*) => {{
-        extern "C" fn native_impl(
-            ctx: &$ty,
+        unsafe extern "C" fn native_impl(
+            ctx: *mut $ty,
             frame: &mut $crate::types::StackFrame,
             ret: $crate::VoidPtr,
             _unk: i64,
         ) {
-            let out = unsafe { ::std::mem::transmute(ret) };
+            let out = unsafe { (ret as *mut ::std::mem::MaybeUninit<_>).as_mut() };
+            if !ctx.is_aligned() { return; }
+            let Some(ctx) = (unsafe { ctx.as_ref() }) else { return };
             $crate::MethodInvocable::invoke($ty::$id, ctx, frame, out);
             unsafe { frame.step() };
         }
@@ -390,10 +444,13 @@ macro_rules! method {
     }
 }
 
-/// A macro for conveniently calling functions and methods.
-/// If you're calling a method, the first argument should be the instance of the class.
-/// The next argument should be a full function name, which might have to include mangled names of
-/// the parameter types.
+/// Calls a reflected function using stack arguments.
+/// Use the full RTTI name, including mangled parameter types where required.
+/// Instance calls take a receiver first. Returns `Result<ReturnType, InvokeError>`.
+/// Arguments use [`IntoRepr`] and the return value uses [`FromRepr`].
+/// Requires initialized engine RTTI.
+///
+/// SDK: [Stack arguments](https://github.com/WopsS/RED4ext.SDK/blob/2216befc23924b46996a9335043aebb31ba6a757/include/RED4ext/Scripting/Stack.hpp).
 ///
 /// # Example
 /// ```rust
@@ -451,7 +508,9 @@ macro_rules! call {
     };
 }
 
-/// A trait for types that can be used as the receiver of a method call.
+/// A receiver accepted by the instance-call form of [`call!`].
+/// Supports values implementing `AsRef<IScriptable>` and class references;
+/// null class references produce [`InvokeError::NullReceiver`].
 #[sealed]
 pub trait AsReceiver {
     #[doc(hidden)]
@@ -539,3 +598,27 @@ impl_args!(
     (A, B, C, D, E, F),
     (A, B, C, D, E, F, G)
 );
+
+#[cfg(test)]
+mod handler_tests {
+    use super::*;
+
+    fn answer() -> i32 {
+        42
+    }
+
+    #[test]
+    fn global_handler_accepts_null_context() {
+        let metadata = crate::global!(c"Answer", answer);
+        // CStackFrame is plain pointer/integer/bool storage. The no-argument
+        // handler only advances code and never reads the null metadata fields.
+        let mut raw: crate::raw::root::RED4ext::CStackFrame = unsafe { std::mem::zeroed() };
+        let mut code = [0i8; 2];
+        raw.code = code.as_mut_ptr();
+        let frame = unsafe { &mut *std::ptr::from_mut(&mut raw).cast::<StackFrame>() };
+        let mut result = MaybeUninit::<i32>::uninit();
+        unsafe { (metadata.func)(std::ptr::null_mut(), frame, result.as_mut_ptr().cast(), 0) };
+        assert_eq!(unsafe { result.assume_init() }, 42);
+        assert_eq!(raw.code, unsafe { code.as_mut_ptr().add(1) });
+    }
+}

@@ -6,14 +6,16 @@ use crate::types::{
     Variant, WeakRef,
 };
 
-/// A trait for types that can be passed across the FFI boundary to the game engine without
-/// any conversion.
+/// A value whose layout matches the engine RTTI type named by `NAME`.
+///
+/// SDK: [RTTI types](https://github.com/WopsS/RED4ext.SDK/blob/2216befc23924b46996a9335043aebb31ba6a757/include/RED4ext/RTTITypes.hpp).
 ///
 /// # Safety
 ///
-/// Implementations of this trait are only valid if the memory representation of Self
-/// is idetical to the representation of type with name Self::NAME in-game.
+/// `Self` must match the named engine type's size, alignment, field layout,
+/// validity, and ownership semantics. A matching name alone is insufficient.
 pub unsafe trait NativeRepr {
+    /// The engine RTTI type name, which may differ from its REDscript name.
     const NAME: &'static str;
 }
 
@@ -72,11 +74,15 @@ impl_native_repr!(EntityId, "EntityID", "entEntityID");
 impl_native_repr!(GameTime, "GameTime", "GameTime");
 impl_native_repr!(Variant, "Variant", "Variant");
 
-/// A trait for types that can be converted into a representation that can be passed across
-/// the FFI boundary to the game.
+/// Converts a Rust value into its engine-compatible [`NativeRepr`].
+///
+/// Native representations pass through unchanged; strings and vectors convert to
+/// [`RedString`] and [`RedArray`], respectively.
 pub trait IntoRepr: Sized {
+    /// The engine-compatible representation of this value.
     type Repr: NativeRepr;
 
+    /// Consumes this value and converts it to its engine representation.
     fn into_repr(self) -> Self::Repr;
 }
 
@@ -130,10 +136,12 @@ impl<A: NativeRepr + Default + PartialEq> IntoRepr for Opt<A> {
     }
 }
 
-/// A trait for types that can be created from a representation passed across the FFI boundary.
+/// Converts an owned engine-compatible representation into a Rust value.
 pub trait FromRepr: Sized {
+    /// The engine-compatible representation consumed by this conversion.
     type Repr: NativeRepr;
 
+    /// Consumes an engine representation and converts it to a Rust value.
     fn from_repr(repr: Self::Repr) -> Self;
 }
 
